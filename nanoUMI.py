@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import pysam
 import csv
 import edlib
@@ -16,14 +18,30 @@ import pandas as pd
 pd.set_option('display.max_rows', None)
 
 
-def featureCounts(bam, gtf, summary, threads=12):
+def samtools_view(input, output, tag, threads=4):
+    p = subprocess.run(
+        ["samtools",
+            "view", 
+            "--threads", str(threads),
+            "-d", str(tag),
+            "-o", output,
+            input],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT) 
+
+    return p.stdout
+
+
+def featureCounts(bamfiles, strand, gtf, summary, threads=12):
     p = subprocess.run(
         ["featureCounts",
             "-T", str(threads),
-            "-L", "-s", "1",
+            "-L",
+            "-s", ','.join(map(str, strand)),
             "-t", "exon", "-g", "gene_id", "-a", gtf,
             "-R", "CORE",
-            "-o", summary, bam],
+            "-o", summary,
+            bamfiles[0], bamfiles[1]],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT)
     
@@ -159,18 +177,43 @@ def main(argv=sys.argv[1:]):
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
 
 
-
     # tempdir
     tempfile.tempdir = os.path.dirname(outfile)
     tempfolder = tempfile.TemporaryDirectory()
 
 
+    # Separate alignments by strand
+    logging.info("Separating alignments by strand...")
+
+    strand_not_detected = 0
+
+    plusbamfile = os.path.join(tempfolder.name, "plus.bam")
+    minusbamfile = os.path.join(tempfolder.name, "minus.bam")
+
+    bam = pysam.AlignmentFile(bamfile)
+    plusbam = pysam.AlignmentFile(plusbamfile, "wb", template=bam)
+    minusbam = pysam.AlignmentFile(minusbamfile, "wb", template=bam)
+
+    for alignment in tqdm(bam):
+        if alignment.has_tag("TS"):
+            strand = alignment.get_tag(tag="TS")
+            if strand == "-":
+                minusbam.write(alignment)
+            else:
+                plusbam.write(alignment)
+        else:
+            strand_not_detected += 1
+
+    bam.close()
+    plusbam.close()
+    minusbam.close()
+                
+
     # assign reads to genes using featureCounts
     logging.info("Assigning reads to genes using featureCounts...")
 
     fcfile = os.path.join(tempfolder.name, os.path.basename(bamfile))
-    os.makedirs(os.path.dirname(fcfile), exist_ok=True)
-    fc_stdout = featureCounts(bamfile, gtffile, fcfile, threads)
+    fc_stdout = featureCounts([plusbamfile, minusbamfile], [1, 2], gtffile, fcfile, threads)
     print(fc_stdout.decode())
 
     # create one folder per gene with a fa file holding all umis
@@ -183,7 +226,7 @@ def main(argv=sys.argv[1:]):
     no_gene_attached = 0
     normalisation_failed = 0
 
-    with open(fcfile + ".featureCounts", newline='') as fc, pysam_open(bamfile) as bam:
+    with open(minusbamfile + ".featureCounts", newline='') as fc, pysam_open(minusbamfile) as bam:
 
         fcin = csv.reader(fc, delimiter='\t')
 
@@ -194,7 +237,7 @@ def main(argv=sys.argv[1:]):
             if read.query_name != row[0]:
                 raise RuntimeError('Read names in bam and fc file are different: {} {} \n'.format(read.query_name, row[0]))
 
-            try:
+            try: # there is a has_tag method
                 umi = read.get_tag(tag="RX")
             
             except:
@@ -223,21 +266,64 @@ def main(argv=sys.argv[1:]):
             elif gene_id == "NA":
                 no_gene_attached += 1
 
+    with open(plusbamfile + ".featureCounts", newline='') as fc, pysam_open(plusbamfile) as bam:
+
+        fcin = csv.reader(fc, delimiter='\t')
+
+        for (read, row) in tqdm(zip(bam, fcin)):
+
+            reads_total += 1
+
+            if read.query_name != row[0]:
+                raise RuntimeError('Read names in bam and fc file are different: {} {} \n'.format(read.query_name, row[0]))
+
+            try: # there is a has_tag method
+                umi = read.get_tag(tag="RX")
+            
+            except:
+                no_rx_tag += 1
+                continue
+
+            gene_id = row[3]
+
+            if umi != "None" and gene_id != "NA":
+                ed, norm_umi = align(umi, pattern, 3, True)
+
+                if norm_umi is None:
+                    normalisation_failed += 1
+                    continue
+
+                good_reads += 1
+            
+                gene_folder = os.path.join(tempfolder.name, gene_id)
+
+                if not os.path.exists(gene_folder):
+                    os.mkdir(gene_folder)
+
+                fasta_header = "|".join([read.query_name, read.get_tag(tag="TS"), read.seq]) 
+                write_fasta(fasta_header, norm_umi, os.path.join(gene_folder, "norm_umi.fa"))
+        
+            elif gene_id == "NA":
+                no_gene_attached += 1
+
+    reads_total = reads_total + strand_not_detected
 
     if logfile is None:
         print("Total reads analysed:", reads_total)
-        print("Successfully recovered umi:", good_reads, "{0:.0%}".format(good_reads / reads_total))
-        print("Reads without RX tag::", no_rx_tag, "{0:.0%}".format(no_rx_tag / reads_total))
-        print("Reads not mapping to gene:", no_gene_attached, "{0:.0%}".format(no_gene_attached / reads_total))
-        print("Failed to normalise umi:", normalisation_failed, "{0:.0%}".format(normalisation_failed / reads_total))
+        print("Successfully recovered UMI:", good_reads, "{0:.0%}".format(good_reads / reads_total))
+        print("Strand not detected:", strand_not_detected, "{0:.0%}".format(strand_not_detected / reads_total))
+        print("UMI not detected:", no_rx_tag, "{0:.0%}".format(no_rx_tag / reads_total))
+        print("Not assigned to gene:", no_gene_attached, "{0:.0%}".format(no_gene_attached / reads_total))
+        print("UMI normalisation failed:", normalisation_failed, "{0:.0%}".format(normalisation_failed / reads_total))
 
     else:
         with open(logfile, "a") as f:   
             print("Total reads analysed:", reads_total, file=f)
-            print("Successfully recovered umi:", good_reads, "{0:.0%}".format(good_reads / reads_total), file=f)
-            print("Reads without RX tag::", no_rx_tag, "{0:.0%}".format(no_rx_tag / reads_total), file=f)
-            print("Reads not mapping to gene:", no_gene_attached, "{0:.0%}".format(no_gene_attached / reads_total), file=f)
-            print("Failed to normalise umi:", normalisation_failed, "{0:.0%}".format(normalisation_failed / reads_total), file=f)
+            print("Successfully recovered UMI:", good_reads, "{0:.0%}".format(good_reads / reads_total), file=f)
+            print("Strand not detected:", strand_not_detected, "{0:.0%}".format(strand_not_detected / reads_total), file=f)
+            print("UMI not detected:", no_rx_tag, "{0:.0%}".format(no_rx_tag / reads_total), file=f)
+            print("Not assigned to gene:", no_gene_attached, "{0:.0%}".format(no_gene_attached / reads_total), file=f)
+            print("UMI normalisation failed:", normalisation_failed, "{0:.0%}".format(normalisation_failed / reads_total), file=f)
 
 
     # cluster umis
